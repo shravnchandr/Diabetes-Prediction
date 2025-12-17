@@ -1,37 +1,33 @@
 import pandas as pd
 import numpy as np
 import xgboost as xgb
+from sklearn.ensemble import StackingClassifier, HistGradientBoostingClassifier
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import accuracy_score, classification_report, f1_score
 
-# Load data
-dataset = pd.read_csv(r"data/diabetes_dataset.csv")
-train_data = pd.read_csv(r"data/train.csv")
-test_data = pd.read_csv(r"data/test.csv")
+dataset = pd.read_csv(
+    r"/kaggle/input/diabetes-health-indicators-dataset/diabetes_dataset.csv"
+)
+train_data = pd.read_csv(r"/kaggle/input/playground-series-s5e12/train.csv")
+test_data = pd.read_csv(r"/kaggle/input/playground-series-s5e12/test.csv")
+
+
+test_ids = test_data["id"].copy()
 
 extra_features = [
-    "glucose_postprandial",
-    "insulin_level",
-    "glucose_fasting",
-    "diabetes_risk_score",
-    "diabetes_stage",
-    "hba1c",
+    col for col in dataset.columns if col not in train_data.columns and col != "id"
 ]
 
-# Get common features
 common_features = [
     col
     for col in dataset.columns
     if col in train_data.columns and col != "diagnosed_diabetes"
 ]
 
-print("=" * 60)
-print("STEP 1: Training Imputation Models")
-print("=" * 60)
-
-# Train imputation models
 imputation_models = {}
 
 for feature in extra_features:
@@ -80,12 +76,7 @@ for feature in extra_features:
     }
     print(f"✓ Trained model for {feature}")
 
-print("\n" + "=" * 60)
-print("STEP 2: Imputing Missing Features")
-print("=" * 60)
 
-
-# Function to impute
 def impute_data(data, models, common_features):
     result = data.copy()
 
@@ -123,57 +114,50 @@ def impute_data(data, models, common_features):
 train_data_imputed = impute_data(train_data, imputation_models, common_features)
 test_data_imputed = impute_data(test_data, imputation_models, common_features)
 
-# Combine all data
+
+def create_features(data):
+    """Apply same feature engineering to all datasets"""
+    data = data.copy()
+    numeric_cols = data.select_dtypes(include=["int64", "float64"]).columns[:8]
+    for i, col1 in enumerate(numeric_cols[:3]):
+        for col2 in numeric_cols[i + 1 : 4]:
+            if col1 in data.columns and col2 in data.columns:
+                data[f"{col1}_x_{col2}"] = data[col1] * data[col2]
+    return data
+
+
 full_data = pd.concat([train_data_imputed, dataset], ignore_index=True)
-
-print(f"\n✓ Full data shape: {full_data.shape}")
-print(f"✓ Total features: {len(full_data.columns) - 1}")
-
-# Continue with training
-import pandas as pd
-import numpy as np
-import xgboost as xgb
-from sklearn.ensemble import (
-    StackingClassifier,
-    RandomForestClassifier,
-    GradientBoostingClassifier,
-)
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report, f1_score
-
-# ... (your existing imputation code) ...
-
-# After getting full_data with imputed features
 labels = full_data["diagnosed_diabetes"]
 diabetes_data = full_data.drop("diagnosed_diabetes", axis=1)
 
-# Feature engineering: Add interactions
-numeric_cols = diabetes_data.select_dtypes(include=["int64", "float64"]).columns[:8]
-for i, col1 in enumerate(numeric_cols[:3]):
-    for col2 in numeric_cols[i + 1 : 4]:
-        diabetes_data[f"{col1}_x_{col2}"] = diabetes_data[col1] * diabetes_data[col2]
+diabetes_data = create_features(diabetes_data)
 
-# Split
 x_train, x_test, y_train, y_test = train_test_split(
     diabetes_data, labels, test_size=0.1, stratify=labels, random_state=42
 )
 
-# Encode categoricals
 cat_cols = x_train.select_dtypes(include=["object"]).columns
+label_encoders = {}
+
 for col in cat_cols:
     le = LabelEncoder()
-    x_train[col] = le.fit_transform(x_train[col].astype(str))
-    x_test[col] = le.transform(x_test[col].astype(str))
+    x_train[col] = x_train[col].fillna("missing").astype(str)
+    x_test[col] = x_test[col].fillna("missing").astype(str)
 
-x_train = x_train.fillna(x_train.median())
-x_test = x_test.fillna(x_train.median())
+    x_train[col] = le.fit_transform(x_train[col])
+    x_test[col] = le.transform(x_test[col])
+    label_encoders[col] = le
 
-# Calculate class weight
+numeric_cols = x_train.select_dtypes(include=["int64", "float64"]).columns
+imputer = SimpleImputer(strategy="median")
+x_train[numeric_cols] = imputer.fit_transform(x_train[numeric_cols])
+x_test[numeric_cols] = imputer.transform(x_test[numeric_cols])
+
+print(f"Training data shape: {x_train.shape}")
+print(f"No NaN in train: {x_train.isnull().sum().sum() == 0}")
+
 scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
 
-# Define base models
 base_models = [
     (
         "xgb",
@@ -203,19 +187,17 @@ base_models = [
         ),
     ),
     (
-        "gb",
-        GradientBoostingClassifier(
-            n_estimators=300,
+        "hist_gb",
+        HistGradientBoostingClassifier(
+            max_iter=300,
             learning_rate=0.05,
             max_depth=5,
-            min_samples_split=10,
+            min_samples_leaf=10,
             random_state=42,
         ),
     ),
 ]
 
-# Stacking ensemble
-print("Training stacking ensemble...")
 stacking = StackingClassifier(
     estimators=base_models,
     final_estimator=LogisticRegression(class_weight="balanced", max_iter=1000),
@@ -225,9 +207,7 @@ stacking = StackingClassifier(
 
 stacking.fit(x_train, y_train)
 
-# Get probabilities and optimize threshold
 y_pred_proba = stacking.predict_proba(x_test)[:, 1]
-
 thresholds = np.arange(0.35, 0.65, 0.01)
 f1_scores = []
 
@@ -236,23 +216,43 @@ for threshold in thresholds:
     f1_scores.append(f1_score(y_test, y_pred, average="macro"))
 
 optimal_threshold = thresholds[np.argmax(f1_scores)]
-print(f"\nOptimal threshold: {optimal_threshold:.3f}")
+print(f"Optimal threshold: {optimal_threshold:.3f}")
 
-# Final predictions
 predictions = (y_pred_proba >= optimal_threshold).astype(int)
-
-print(f"\n{'='*60}")
-print("FINAL RESULTS")
-print(f"{'='*60}")
+print(f"\nValidation Results:")
 print(f"Accuracy: {accuracy_score(y_test, predictions):.6f}")
-print("\nClassification Report:")
 print(classification_report(y_test, predictions))
 
-# Feature importance from XGBoost
-xgb_model = base_models[0][1]
-feature_importance = pd.DataFrame(
-    {"feature": x_train.columns, "importance": xgb_model.feature_importances_}
-).sort_values("importance", ascending=False)
+test_data_imputed = create_features(test_data_imputed)
 
-print("\nTop 10 Most Important Features:")
-print(feature_importance.head(10))
+cat_cols = test_data_imputed.select_dtypes(include=["object"]).columns
+for col in cat_cols:
+    if col in label_encoders:
+        le = label_encoders[col]
+        test_data_imputed[col] = test_data_imputed[col].fillna("missing").astype(str)
+        test_data_imputed[col] = test_data_imputed[col].apply(
+            lambda x: x if x in le.classes_ else "missing"
+        )
+        test_data_imputed[col] = le.transform(test_data_imputed[col])
+
+missing_cols = set(x_train.columns) - set(test_data_imputed.columns)
+for col in missing_cols:
+    test_data_imputed[col] = 0
+
+test_data_imputed = test_data_imputed[x_train.columns]
+
+numeric_cols = test_data_imputed.select_dtypes(include=["int64", "float64"]).columns
+test_data_imputed[numeric_cols] = imputer.transform(test_data_imputed[numeric_cols])
+
+y_pred_proba_test = stacking.predict_proba(test_data_imputed)[:, 1]
+predictions_test = (y_pred_proba_test >= optimal_threshold).astype(int)
+
+submission_csv = pd.DataFrame({"id": test_ids, "diagnosed_diabetes": predictions_test})
+
+submission_csv.to_csv("submission.csv", index=False)
+
+print(f"\n✓ Submission saved!")
+print(f"Total predictions: {len(submission_csv)}")
+print(f"\nPrediction distribution:")
+print(submission_csv["diagnosed_diabetes"].value_counts())
+print(f"\nProportion of positive class: {(predictions_test == 1).mean():.3f}")
